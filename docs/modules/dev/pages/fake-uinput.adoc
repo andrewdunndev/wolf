@@ -29,14 +29,25 @@ unknown field), and it matches how `GOW_REQUIRED_DEVICES` and `RUN_SWAY` are alr
 For those apps Wolf injects a small `LD_PRELOAD` shim (`src/fake-uinput`) that intercepts only
 `ioctl(fd, UI_DEV_CREATE)` and `UI_DEV_DESTROY`; everything else is passed straight through. On
 create the shim resolves the new device's sysfs name (`UI_GET_SYSNAME`) and tells Wolf about it over
-the control socket.
+a socket that belongs to that session.
 
-.The endpoints the shim calls
+The shim is built for every architecture the app may run (x86_64 and i686 for Steam's 32-bit client,
+aarch64 on Arm) and mounted under `/usr/lib/wolf/fake-uinput/<arch>/`. `LD_PRELOAD` names it with the
+loader's `$PLATFORM` token, so each process loads the matching build whatever the image's own library
+layout is. On x86_64 glibc expands `$PLATFORM` to `haswell` or `xeon_phi` on Intel CPUs of that class
+instead of `x86_64`, so the 64-bit build is mounted under those names too.
+
+.The requests the shim sends
 [source]
 ....
-POST /api/v1/runtime/plug-udev-device     {"session_id": ..., "sysfs_name": "input42"}
-POST /api/v1/runtime/unplug-udev-device   {"session_id": ..., "sysfs_name": "input42"}
+POST /api/v1/runtime/plug-udev-device     {"sysfs_name": "input42"}
+POST /api/v1/runtime/unplug-udev-device   {"sysfs_name": "input42"}
 ....
+
+The body does not say which session it is from. When Wolf starts the session's container it creates a
+socket for that session alone (`<state folder>/runtime/wolf-runtime-<session id>.sock`, a directory no container sees), mounts it into that
+container at `/var/run/wolf/wolf-runtime.sock` and points `WOLF_FAKE_UINPUT_SOCKET` at it. The session is
+the one the socket was made for. The socket is removed when the container ends.
 
 Wolf reads the device from sysfs and hands it to the same code path it uses for its own pads: `mknod`
 the node into the right container and broadcast the udev event through fake-udev. The container is
@@ -56,13 +67,14 @@ participant Runner as "docker runner"
 
 App->uinput: open + UI_DEV_CREATE
 Shim->uinput: (passthrough) real device created on host
-Shim->Wolf: POST plug-udev-device {session_id, sysfs_name}
+Shim->Wolf: POST plug-udev-device {sysfs_name} (on the session's socket)
 Wolf->Runner: PlugDeviceEvent
 Runner->App: mknod node in container + fake-udev "add"
 App->App: game opens /dev/input/eventX
 ....
 
-The relevant code is `src/fake-uinput` (the shim), `api/fake_uinput.hpp` (sysfs -> `PlugDeviceEvent`),
+The relevant code is `src/fake-uinput` (the shim), `api/runtime_socket.cpp` (the per-session socket),
+`api/runtime_requests.hpp` (request validation), `api/fake_uinput.hpp` (sysfs -> `PlugDeviceEvent`),
 and the injection in `sessions/common.cpp`.
 
 == Security
@@ -81,7 +93,43 @@ choose a button mapping. Instead the shim sets `phys` to `wolf-fake-uinput/0` (a
 the `UI_DEV_CREATE` it is already intercepting), and `85-wolf.rules` matches on that, parking the
 device on the dead `seat9` and stripping its `uaccess` ACL.
 
+=== What Wolf checks
+
+A request comes from an app in a container, so Wolf treats it as untrusted:
+
+* The socket is per session and mounted into one container only. The caller's session is never read from
+  the request: a body that names another session is ignored, and a container that was not given the socket
+  cannot reach it. The socket file is owned by the user the app runs as, mode `0600`, and is created with
+  no group or other access. If Wolf cannot give it to that user (a user namespace that does not map it,
+  say) it falls back to mode `0666`, which any user inside that one container, and anything on the host
+  that can see the state folder, can then connect to. Wolf logs a warning when that happens. The
+  `0600` mode also assumes the app's user id is the same in Wolf's and the container's view.
+* A device is claimed by the first session to name it. The check that the device is a shim-made virtual
+  one cannot tell which container created it, so in the short window between an app creating a device
+  and plugging it, another opted-in session that names the same `input<N>` first receives its nodes
+  and the owner is refused (409). Only apps that were opted in can try this.
+* `sysfs_name` must match `input<N>`. It is resolved through `/sys/class/input` and the result must be a
+  direct child of `/sys/devices/virtual/input` that carries the shim's `phys` marker. A path, a name that
+  climbs out of the tree and real hardware are all refused.
+* A device can be held by one session at a time, and only the session that plugged it can unplug it.
+* Requests are bounded: the head is at most 4 KiB, the body at most 256 bytes, a connection gets five
+  seconds, and a session may have a few connections open at once. Only the two requests above are served.
+
+=== Lifecycle and host setup
+
+A session's socket is removed when the session ends, and any left behind by a Wolf that died are removed
+when Wolf starts. If Wolf restarts while an app keeps running, that app's socket is gone: its shim gets a
+connection error (logged, never fatal) and its devices are not plugged until the app is restarted.
+
+On a host with SELinux the shim libraries and the runtime sockets live under the state folder, which the
+container must be allowed to read: label it `container_file_t` (or whatever type your policy gives to
+container content), or the app cannot load the shim.
+
+=== The remaining limit
+
 That covers devices the shim knows about. A process in the container still holds the real `/dev/uinput`
-and could create a device by some other route, so this is a narrowing rather than a boundary. The fully
-isolated alternative, never exposing the real device and emulating `uinput` end to end (e.g. over CUSE),
-is heavier; this change trades that for a small, dependency-free implementation.
+and can create a device by some other route, without the shim and without the `phys` marker, so the
+marker is advisory and the container is not isolated from the host's input stack. Enable `WOLF_FAKE_UINPUT`
+only for apps you would otherwise hand `/dev/uinput`. The fully isolated alternative, never exposing the
+real device and emulating `uinput` end to end (e.g. over CUSE), is heavier; this change trades that for a
+small, dependency-free implementation.
