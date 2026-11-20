@@ -6,12 +6,16 @@
 // Wolf does the mknod + fake-udev on the host via the same path it uses for its own virtual pads.
 // So the container needs no privilege, not even CAP_MKNOD.
 //
-// Wolf sets these in the container's env:
-//   WOLF_FAKE_UINPUT_SOCKET - Wolf's restricted device plug/unplug socket
-//   WOLF_SESSION_ID   - identifies the session so Wolf injects into the right container
+// Wolf sets this in the container's env:
+//   WOLF_FAKE_UINPUT_SOCKET - this session's device plug/unplug socket. It is mounted into this
+//                             container only, so Wolf knows the session from the socket itself and the
+//                             shim does not say who it is.
 //
-// Built 64- and 32-bit (Steam's client is 32-bit); both are LD_PRELOAD'd and the loader skips the
-// wrong-arch one. See docs/modules/dev/pages/fake-uinput.adoc.
+// Built 64- and 32-bit (Steam's client is 32-bit); Wolf mounts each build in its own directory and
+// LD_PRELOAD picks one per process (see sessions/common.cpp and docs/modules/dev/pages/fake-uinput.adoc).
+//
+// Plain C inside: no libstdc++ symbols, because the library is built on Fedora and preloaded into
+// other distributions' images, whose C++ runtime and TLS conventions it must not depend on.
 
 #include <cerrno>
 #include <cstdarg>
@@ -21,7 +25,6 @@
 #include <ctime>
 #include <dlfcn.h>
 #include <linux/uinput.h>
-#include <string>
 #include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <sys/un.h>
@@ -46,7 +49,7 @@ static bool load_library() {
 }
 
 // pure C stdio -- safe from an LD_PRELOAD constructor (before libstdc++ iostreams exist)
-static void logline(const std::string &msg) {
+static void logline(const char *msg) {
   char ts[32] = "?";
   struct timespec tp {};
   clock_gettime(CLOCK_REALTIME, &tp);
@@ -69,32 +72,22 @@ static void logline(const std::string &msg) {
   // FAKE_UINPUT_LOG points at one -- useful for debugging, off by default (no hardcoded paths).
   if (const char *lp = getenv("FAKE_UINPUT_LOG")) {
     if (FILE *f = fopen(lp, "a")) {
-      fprintf(f, "%s%s\n", hdr, msg.c_str());
+      fprintf(f, "%s%s\n", hdr, msg);
       fclose(f);
     }
   }
-  fprintf(stderr, "%s%s\n", hdr, msg.c_str());
-}
-
-static std::string json_escape(const std::string &s) {
-  std::string o;
-  for (char c : s) {
-    if (c == '"' || c == '\\')
-      o += '\\';
-    o += c;
-  }
-  return o;
+  fprintf(stderr, "%s%s\n", hdr, msg);
 }
 
 // Minimal HTTP/1.1 POST over the AF_UNIX control socket. Returns the numeric status
-// (e.g. 200) or -1 on transport failure. Short timeouts so a wedged Wolf never blocks Steam.
-static int wolf_post(const std::string &path, const std::string &body) {
+// (e.g. 200) or -1 on transport failure. 2 s timeouts on send and receive bound a wedged Wolf to a few seconds.
+static int wolf_post(const char *path, const char *body) {
   const char *sock = getenv("WOLF_FAKE_UINPUT_SOCKET");
   if (!sock || !*sock) {
     logline("WARN WOLF_FAKE_UINPUT_SOCKET unset; cannot notify Wolf");
     return -1;
   }
-  int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+  int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
   if (fd < 0)
     return -1;
   struct timeval tv {};
@@ -107,24 +100,32 @@ static int wolf_post(const std::string &path, const std::string &body) {
   addr.sun_family = AF_UNIX;
   strncpy(addr.sun_path, sock, sizeof(addr.sun_path) - 1);
   if (connect(fd, reinterpret_cast<struct sockaddr *>(&addr), sizeof(addr)) != 0) {
-    logline(std::string("WARN connect(") + sock + ") failed: " + strerror(errno));
+    char msg[256];
+    snprintf(msg, sizeof(msg), "WARN connect(%s) failed: %s", sock, strerror(errno));
+    logline(msg);
     close(fd);
     return -1;
   }
 
-  std::string req = "POST " + path +
-                    " HTTP/1.1\r\n"
-                    "Host: localhost\r\n"
-                    "Content-Type: application/json\r\n"
-                    "Content-Length: " +
-                    std::to_string(body.size()) +
-                    "\r\n"
-                    "Connection: close\r\n\r\n" +
-                    body;
+  char req[512];
+  int len = snprintf(req,
+                     sizeof(req),
+                     "POST %s HTTP/1.1\r\n"
+                     "Host: localhost\r\n"
+                     "Content-Type: application/json\r\n"
+                     "Content-Length: %zu\r\n"
+                     "Connection: close\r\n\r\n%s",
+                     path,
+                     strlen(body),
+                     body);
+  if (len <= 0 || (size_t)len >= sizeof(req)) {
+    close(fd);
+    return -1;
+  }
 
   size_t off = 0;
-  while (off < req.size()) {
-    ssize_t w = write(fd, req.data() + off, req.size() - off);
+  while (off < (size_t)len) {
+    ssize_t w = send(fd, req + off, (size_t)len - off, MSG_NOSIGNAL); // no SIGPIPE if Wolf hung up
     if (w <= 0) {
       close(fd);
       return -1;
@@ -132,7 +133,7 @@ static int wolf_post(const std::string &path, const std::string &body) {
     off += (size_t)w;
   }
 
-  // Parse just the status code from "HTTP/1.1 <code> ..."
+  // Parse just the status code from "HTTP/1.x <code> ..."
   char buf[256] = {0};
   ssize_t n = read(fd, buf, sizeof(buf) - 1);
   close(fd);
@@ -147,17 +148,24 @@ static int wolf_post(const std::string &path, const std::string &body) {
   return code;
 }
 
-static void notify(const std::string &path, const std::string &sysname) {
-  const char *sid = getenv("WOLF_SESSION_ID");
-  std::string body = std::string("{\"session_id\":\"") + json_escape(sid ? sid : "") + "\",\"sysfs_name\":\"" +
-                     json_escape(sysname) + "\"}";
+// `sysname` comes from UI_GET_SYSNAME, i.e. "input<N>": nothing in it needs JSON escaping.
+static void notify(const char *path, const char *sysname) {
+  char body[128];
+  snprintf(body, sizeof(body), "{\"sysfs_name\":\"%s\"}", sysname);
   int code = wolf_post(path, body);
   // Log failures always; a successful plug/unplug only under FAKE_UINPUT_DEBUG (Steam creates and
   // tears down its pad on every focus change, so per-event logging would be very noisy otherwise).
   const char *dbg = getenv("FAKE_UINPUT_DEBUG");
-  if (code != 200 || (dbg && dbg[0] == '1'))
-    logline(std::string(path == PLUG_PATH ? "plug" : "unplug") + " sysfs=" + sysname +
-            " session=" + (sid ? sid : "(unset)") + " -> wolf http=" + std::to_string(code));
+  if (code != 200 || (dbg && dbg[0] == '1')) {
+    char msg[192];
+    snprintf(msg,
+             sizeof(msg),
+             "%s sysfs=%s -> wolf http=%d",
+             strcmp(path, PLUG_PATH) == 0 ? "plug" : "unplug",
+             sysname,
+             code);
+    logline(msg);
+  }
 }
 
 static bool get_sysname(int fd, char *out, size_t cap) {
@@ -183,10 +191,14 @@ extern "C" int ioctl(int fd, unsigned long request, ...) {
 
   // Has to happen before the device exists, so it is set here rather than after the create below.
   // A failure is not fatal: the device still works, it just will not be caught by the udev rule.
-  if (request == UI_DEV_CREATE && real_ioctl(fd, UI_SET_PHYS, (void *)SHIM_PHYS) < 0)
-    logline(std::string("WARN UI_SET_PHYS failed: ") + strerror(errno));
+  if (request == UI_DEV_CREATE && real_ioctl(fd, UI_SET_PHYS, (void *)SHIM_PHYS) < 0) {
+    char msg[128];
+    snprintf(msg, sizeof(msg), "WARN UI_SET_PHYS failed: %s", strerror(errno));
+    logline(msg);
+  }
 
   int result = real_ioctl(fd, request, arg);
+  const int saved_errno = errno; // notify() talks to Wolf and may change it
 
   if (result >= 0 && request == UI_DEV_CREATE) {
     char buf[sizeof(SYS_INPUT_DIR) + 64] = SYS_INPUT_DIR;
@@ -198,6 +210,7 @@ extern "C" int ioctl(int fd, unsigned long request, ...) {
     notify(UNPLUG_PATH, destroy_buf + strlen(SYS_INPUT_DIR));
   }
 
+  errno = saved_errno;
   return result;
 }
 

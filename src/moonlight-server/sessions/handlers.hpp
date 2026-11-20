@@ -41,6 +41,9 @@ struct RunnerArgs {
   const std::string &xdg_runtime_dir;
 
   immer::box<config::ClientSettings> client_settings;
+
+  /// Where the runner's session reports a device it created for itself (see api/runtime_socket.hpp)
+  std::shared_ptr<events::EventBusType> ev_bus;
 };
 
 /**

@@ -1,6 +1,6 @@
 # fake-uinput: LD_PRELOAD shim that lets containerized apps (e.g. Steam Input) create uinput
 # devices in an unprivileged Wolf session container. It intercepts ioctl(UI_DEV_CREATE/DESTROY)
-# and notifies Wolf over the control socket; Wolf performs the privileged mknod + fake-udev.
+# and notifies Wolf over the session's runtime socket; Wolf performs the privileged mknod + fake-udev.
 # Structure mirrors src/fake-udev. Build 64-bit here; the 32-bit variant is built directly in the
 # Dockerfile (Steam's client is 32-bit) since the shim has no dependencies beyond libc/libdl.
 option(BUILD_FAKE_UINPUT "Build fake-uinput shim library" ON)

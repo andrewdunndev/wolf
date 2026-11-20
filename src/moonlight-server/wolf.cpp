@@ -1,4 +1,5 @@
 #include <api/api.hpp>
+#include <api/runtime_socket.hpp>
 #include <atomic>
 #include <audio/pulse_router.hpp>
 #include <boost/asio.hpp>
@@ -88,6 +89,9 @@ state::Host get_host_config(std::string_view pkey_filename, std::string_view cer
     logs::log(logs::warning,
               "Unable to get the container that is running Wolf, automatic mounts matching is disabled.");
   }
+
+  // Sockets of sessions that were running when a previous Wolf died are of no use to anyone
+  wolf::api::SessionRuntimeSocket::remove_stale(std::filesystem::path(local_base_state_folder) / "runtime");
 
   return {state::DISPLAY_CONFIGURATIONS,
           state::AUDIO_CONFIGURATIONS,

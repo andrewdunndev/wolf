@@ -10,11 +10,12 @@
 #include <map>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 /**
- * Helpers for the fake-uinput runtime device injection (see api/endpoints.cpp and
- * src/fake-uinput). Turns a uinput device that an app created inside a container -- known to Wolf
+ * Helpers for the fake-uinput runtime device injection (see api/runtime_socket.cpp
+ * and src/fake-uinput). Turns a uinput device that an app created inside a container -- known to Wolf
  * only by its sysfs name -- into the PlugDeviceEvent that the docker runner consumes to mknod the
  * node and broadcast the udev event.
  *
@@ -58,17 +59,50 @@ inline const char *classify(const std::filesystem::path &input_dir, const std::s
   return nullptr;
 }
 
-// Build a PlugDeviceEvent for every event*/js* node of the device at
-// /sys/devices/virtual/input/<sysfs_name>. The field set mirrors gen_udev_base_event (uinput.hpp);
+// A sysfs input name as the kernel assigns it to a uinput device: "input" and a number, nothing else.
+// The name arrives from a container, so it is matched strictly before it touches a path.
+inline bool is_valid_sysfs_name(std::string_view name) {
+  constexpr std::string_view prefix = "input";
+  if (name.size() <= prefix.size() || name.size() > prefix.size() + 9 || name.substr(0, prefix.size()) != prefix)
+    return false;
+  return std::all_of(name.begin() + prefix.size(), name.end(), [](char c) { return c >= '0' && c <= '9'; });
+}
+
+// What the shim stamps into phys (see src/fake-uinput). Devices without it were not created through the
+// shim; Wolf refuses to plug them. A hostile app that holds /dev/uinput can still forge it, so this is
+// a guard against mistakes and against naming someone else's device, not a security boundary.
+inline constexpr std::string_view SHIM_PHYS_PREFIX = "wolf-fake-uinput/";
+
+// Resolve a client-supplied sysfs name to the device directory, or nullopt. Only a direct child of
+// `virtual_root` qualifies, reached through `class_input` (/sys/class/input): the symlink is followed
+// and its target must still be a virtual input device, so a name can neither climb out of the tree nor
+// select real hardware, and the device must carry the shim's phys marker.
+inline std::optional<std::filesystem::path> resolve_input_dir(const std::filesystem::path &class_input,
+                                                              const std::filesystem::path &virtual_root,
+                                                              std::string_view name) {
+  if (!is_valid_sysfs_name(name))
+    return std::nullopt;
+  std::error_code ec;
+  const auto root = std::filesystem::canonical(virtual_root, ec);
+  if (ec)
+    return std::nullopt;
+  const auto dir = std::filesystem::canonical(class_input / std::string(name), ec);
+  if (ec || dir.parent_path() != root)
+    return std::nullopt;
+  std::ifstream phys(dir / "phys");
+  std::string marker;
+  if (!std::getline(phys, marker) || marker.compare(0, SHIM_PHYS_PREFIX.size(), SHIM_PHYS_PREFIX) != 0)
+    return std::nullopt;
+  return dir;
+}
+
+// Build a PlugDeviceEvent for every event*/js* node of the device directory `input_dir` (from
+// resolve_input_dir). The field set mirrors gen_udev_base_event (uinput.hpp);
 // we can't reuse it directly because it stat()s the /dev node for major:minor and that node doesn't
 // exist yet, so we read major:minor from sysfs instead. Returns nullopt if nothing is found.
 inline std::optional<events::PlugDeviceEvent> build_plug_event(const std::string &session_id,
-                                                               const std::string &sysfs_name) {
-  auto input_dir = std::filesystem::path("/sys/devices/virtual/input") / sysfs_name;
+                                                               const std::filesystem::path &input_dir) {
   std::error_code ec;
-  if (!std::filesystem::exists(input_dir, ec))
-    return std::nullopt;
-
   const auto now = std::chrono::system_clock::now();
   const auto usec = std::to_string(std::chrono::duration_cast<std::chrono::seconds>(now.time_since_epoch()).count());
 

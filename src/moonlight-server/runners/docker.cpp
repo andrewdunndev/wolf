@@ -205,13 +205,15 @@ void RunDocker::run(std::string_view session_id,
     docker_api.start_by_id(container_id);
 
     // Let the unprivileged run user open an injected /dev/uinput: chown it to PUID:PGID, mode 0660
-    // (not world-writable). No-op when uinput wasn't injected.
-    docker_api.exec(
-        container_id,
-        {"/bin/sh",
-         "-c",
-         "[ -e /dev/uinput ] && chown \"${PUID:-0}:${PGID:-0}\" /dev/uinput && chmod 0660 /dev/uinput || true"},
-        "root");
+    // (not world-writable). Only for apps that opted in, which are the ones that were given it.
+    if (needs_fake_uinput()) {
+      docker_api.exec(
+          container_id,
+          {"/bin/sh",
+           "-c",
+           "[ -e /dev/uinput ] && chown \"${PUID:-0}:${PGID:-0}\" /dev/uinput && chmod 0660 /dev/uinput || true"},
+          "root");
+    }
 
     logs::log(logs::info, "[DOCKER] Starting container: {}", docker_container->name);
     logs::log(logs::debug, "[DOCKER] Starting container: {}", *docker_container);

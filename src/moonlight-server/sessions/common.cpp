@@ -1,6 +1,9 @@
-#include <map>
+#include <algorithm>
+#include <api/runtime_socket.hpp>
+#include <cctype>
 #include <immer/array_transient.hpp>
 #include <immer/map_transient.hpp>
+#include <map>
 #include <platforms/hw.hpp>
 #include <sessions/common.hpp>
 #include <sessions/handlers.hpp>
@@ -10,6 +13,9 @@ namespace wolf::core::sessions {
 void start_runner(std::shared_ptr<events::Runner> runner,
                   std::shared_ptr<events::devices_atom_queue> plugged_devices_queue,
                   immer::box<RunnerArgs> args) {
+  // Lives as long as the runner does; closing it removes the socket and what the session still holds
+  std::unique_ptr<api::SessionRuntimeSocket> runtime_socket;
+
   /* Setup devices paths */
   auto all_devices = immer::array_transient<std::string>();
 
@@ -75,7 +81,7 @@ void start_runner(std::shared_ptr<events::Runner> runner,
   // Apps that opt in (WOLF_FAKE_UINPUT=1, see runners/docker.cpp) can create their own uinput
   // devices (e.g. Steam Input): give them the fake-uinput shim, the real /dev/uinput and the control
   // socket. The shim asks Wolf to do the privileged mknod + fake-udev, so the container stays
-  // otherwise unprivileged. See xref dev/fake-uinput.
+  // otherwise unprivileged (docs: dev/fake-uinput).
   if (runner->needs_fake_uinput()) {
     // startup.sh ships one library per loader $PLATFORM under <state>/fake-uinput (x86_64 and i686 for
     // Steam's 32-bit client, aarch64, ...). Each is mounted under a Wolf-owned prefix instead of the
@@ -107,18 +113,44 @@ void start_runner(std::shared_ptr<events::Runner> runner,
     if (std::filesystem::exists("/dev/uinput"))
       all_devices.push_back("/dev/uinput");
 
-    // The restricted socket, not wolf.sock: the shim only needs plug/unplug. Bind mounting a path
-    // that doesn't exist yet makes the runtime create a directory there instead (see wolf#462), so
-    // check first and leave it out rather than handing the app a directory named like a socket.
-    auto runtime_sock = std::filesystem::path(args->host->host_xdg_runtime_dir) / "wolf-runtime.sock";
-    if (std::filesystem::is_socket(runtime_sock)) {
-      mounted_paths.push_back({runtime_sock, "/var/run/wolf/wolf-runtime.sock"});
+    // Each session gets a socket of its own, mounted into this container only: the session a request
+    // belongs to is the one the socket was made for, so an app cannot plug a device into another
+    // session. Not wolf.sock either: this one serves nothing but the shim's plug/unplug. It lives under
+    // the state folder, kept out of the runtime directory so that no mount of that directory can expose
+    // it to another session.
+    const auto socket_name = fmt::format("wolf-runtime-{}.sock", args->session_id);
+    const auto local_socket = std::filesystem::path(args->host->local_base_state_folder) / "runtime" / socket_name;
+    const bool safe_id = std::all_of(args->session_id.begin(), args->session_id.end(), [](char c) {
+      return std::isalnum(static_cast<unsigned char>(c)) || c == '-' || c == '_';
+    });
+    std::error_code mkdir_ec;
+    std::filesystem::create_directories(local_socket.parent_path(), mkdir_ec);
+    std::filesystem::permissions(local_socket.parent_path(),
+                                 std::filesystem::perms::owner_all,
+                                 std::filesystem::perm_options::replace,
+                                 mkdir_ec);
+    if (safe_id && local_socket.string().size() < 100) {
+      runtime_socket = api::SessionRuntimeSocket::open(
+          args->session_id,
+          local_socket,
+          [queue = plugged_devices_queue](events::PlugDeviceEvent ev) {
+            queue->push(immer::box<events::PlugDeviceEvent>(std::move(ev)));
+          },
+          [bus = args->ev_bus](events::UnplugDeviceEvent ev) {
+            bus->fire_event(immer::box<events::UnplugDeviceEvent>(std::move(ev)));
+          },
+          args->client_settings->run_uid,
+          args->client_settings->run_gid);
+    }
+    if (runtime_socket) {
+      mounted_paths.push_back({std::filesystem::path(args->host->host_base_state_folder) / "runtime" / socket_name,
+                               "/var/run/wolf/wolf-runtime.sock"});
       full_env.set("WOLF_FAKE_UINPUT_SOCKET", "/var/run/wolf/wolf-runtime.sock");
     } else {
       logs::log(logs::warning,
-                "[FAKE-UINPUT] {} is not a socket, skipping: apps in this session won't be able to "
-                "create their own virtual devices",
-                runtime_sock.string());
+                "[FAKE-UINPUT] no runtime socket for session {}: apps in it won't be able to create their own "
+                "virtual devices",
+                args->session_id);
     }
   }
 
