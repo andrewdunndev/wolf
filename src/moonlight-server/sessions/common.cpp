@@ -1,3 +1,4 @@
+#include <map>
 #include <immer/array_transient.hpp>
 #include <immer/map_transient.hpp>
 #include <platforms/hw.hpp>
@@ -76,14 +77,32 @@ void start_runner(std::shared_ptr<events::Runner> runner,
   // socket. The shim asks Wolf to do the privileged mknod + fake-udev, so the container stays
   // otherwise unprivileged. See xref dev/fake-uinput.
   if (runner->needs_fake_uinput()) {
-    // Preload the shim by bare soname, dropping each build into the matching multiarch dir so the
-    // loader resolves it per-arch from its default search path (Steam spawns both 32- and 64-bit
-    // processes). Not via LD_LIBRARY_PATH on purpose: that would override the app's own and break
-    // Steam's runtime. startup.sh ships the libs under <state>/fake-uinput, like fake-udev above.
-    auto fu_dir = std::filesystem::path(args->host->host_base_state_folder) / "fake-uinput";
-    mounted_paths.push_back({fu_dir / "lib64/libfake-uinput.so", "/usr/lib/x86_64-linux-gnu/libfake-uinput.so"});
-    mounted_paths.push_back({fu_dir / "lib32/libfake-uinput.so", "/usr/lib/i386-linux-gnu/libfake-uinput.so"});
-    full_env.set("LD_PRELOAD", "libfake-uinput.so");
+    // startup.sh ships one library per loader $PLATFORM under <state>/fake-uinput (x86_64 and i686 for
+    // Steam's 32-bit client, aarch64, ...). Each is mounted under a Wolf-owned prefix instead of the
+    // image's own library directories, which differ per distro (Debian multiarch, /usr/lib64, ...),
+    // and LD_PRELOAD names the file with $PLATFORM so the loader picks the matching one per process.
+    // Not via LD_LIBRARY_PATH on purpose: that would override the app's own and break Steam's runtime.
+    // $PLATFORM is not always the architecture name: on x86_64 glibc reports "haswell" or "xeon_phi" for
+    // Intel CPUs of that class, so the 64-bit library is also mounted under those names.
+    const std::filesystem::path shim_prefix = "/usr/lib/wolf/fake-uinput";
+    const std::map<std::string, std::vector<std::string>> platform_aliases = {{"x86_64", {"haswell", "xeon_phi"}}};
+    std::error_code ec;
+    for (const auto &entry :
+         std::filesystem::directory_iterator(std::filesystem::path(args->host->local_base_state_folder) / "fake-uinput",
+                                             ec)) {
+      auto lib = entry.path() / "libfake-uinput.so";
+      if (entry.is_directory(ec) && std::filesystem::exists(lib, ec)) {
+        const auto arch = entry.path().filename();
+        const auto host_lib = std::filesystem::path(args->host->host_base_state_folder) / "fake-uinput" / arch /
+                              "libfake-uinput.so";
+        mounted_paths.push_back({host_lib, shim_prefix / arch / "libfake-uinput.so"});
+        if (auto aliases = platform_aliases.find(arch.string()); aliases != platform_aliases.end()) {
+          for (const auto &alias : aliases->second)
+            mounted_paths.push_back({host_lib, shim_prefix / alias / "libfake-uinput.so"});
+        }
+      }
+    }
+    full_env.set("LD_PRELOAD", (shim_prefix / "$PLATFORM" / "libfake-uinput.so").string());
 
     if (std::filesystem::exists("/dev/uinput"))
       all_devices.push_back("/dev/uinput");

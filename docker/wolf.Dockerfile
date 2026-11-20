@@ -70,12 +70,18 @@ RUN --mount=type=cache,target=/cache/ccache \
     # We have to copy out the built executables because this will only be available inside the buildkit cache
     cp $CMAKE_BUILD_DIR/src/moonlight-server/wolf /wolf/wolf && \
     cp $CMAKE_BUILD_DIR/src/fake-udev/fake-udev /wolf/fake-udev && \
-    cp $CMAKE_BUILD_DIR/src/fake-uinput/libfake-uinput.so /wolf/libfake-uinput.so
+    mkdir -p /wolf/fake-uinput/$(uname -m) && \
+    cp $CMAKE_BUILD_DIR/src/fake-uinput/libfake-uinput.so /wolf/fake-uinput/$(uname -m)/libfake-uinput.so
 
-# Build the 32-bit fake-uinput shim too: Steam's client is 32-bit and LD_PRELOADs into that process.
-# The shim has no dependencies beyond libc/libdl/libstdc++, so a direct multilib compile is enough.
-RUN apt-get update && apt-get install -y --no-install-recommends g++-multilib && \
-    g++ -m32 -shared -fPIC -O2 -std=c++17 -o /wolf/libfake-uinput-32.so /wolf/src/fake-uinput/fake-uinput.cpp
+# Steam's client is 32-bit and LD_PRELOADs the fake-uinput shim into that process, so x86_64 builds
+# also need an i686 copy. The shim is one dependency-free translation unit, so a direct multilib
+# compile is enough. Directories are named after the loader's $PLATFORM (see sessions/common.cpp).
+RUN if [ "$(uname -m)" = "x86_64" ]; then \
+      dnf install -y glibc-devel.i686 libstdc++-devel.i686 && dnf clean all && \
+      mkdir -p /wolf/fake-uinput/i686 && \
+      g++ -m32 -shared -fPIC -O2 -std=c++17 -fno-exceptions -fno-rtti -nostdlib++ -Wl,--as-needed \
+        -o /wolf/fake-uinput/i686/libfake-uinput.so /wolf/src/fake-uinput/fake-uinput.cpp; \
+    fi
 
 ########################################################
 FROM $BASE_IMAGE AS runner
@@ -136,8 +142,7 @@ RUN mkdir -p $WOLF_CFG_FOLDER
 
 COPY --from=wolf-builder /wolf/wolf /wolf/wolf
 COPY --from=wolf-builder /wolf/fake-udev /wolf/fake-udev
-COPY --from=wolf-builder /wolf/libfake-uinput.so /wolf/libfake-uinput.so
-COPY --from=wolf-builder /wolf/libfake-uinput-32.so /wolf/libfake-uinput-32.so
+COPY --from=wolf-builder /wolf/fake-uinput /wolf/fake-uinput
 
 ENV GST_GL_API=gles2 \
     GST_GL_PLATFORM=egl \

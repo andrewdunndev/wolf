@@ -11,6 +11,10 @@ if (BUILD_FAKE_UINPUT)
     add_library(fake-uinput::lib ALIAS fake_uinput)
 
     target_compile_features(fake_uinput PRIVATE cxx_std_17)
+    # Preloaded into other distributions' app images: depend on libc and nothing else, so no C++ runtime.
+    target_compile_options(fake_uinput PRIVATE -fno-exceptions -fno-rtti)
+    # --as-needed: the g++ driver otherwise adds libgcc_s, which the shim does not use.
+    target_link_options(fake_uinput PRIVATE -nostdlib++ -Wl,--as-needed)
     target_link_libraries(fake_uinput PRIVATE ${CMAKE_DL_LIBS})
     set_target_properties(fake_uinput PROPERTIES OUTPUT_NAME "fake-uinput")
     # The 32-bit build is produced directly in docker/wolf.Dockerfile with `g++ -m32` (the shim is a
